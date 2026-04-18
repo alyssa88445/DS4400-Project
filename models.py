@@ -16,9 +16,11 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, roc_auc_score, roc_curve, confusion_matrix)
 from torch.utils.data import DataLoader, TensorDataset
+
 
 # Use MPS (Apple Silicon), CUDA or CPU
 if torch.backends.mps.is_available():
@@ -79,74 +81,63 @@ BASE_FEATURES = [
     'price_to_ma20', 'price_to_ma50',
     'vol_10', 'vol_20', 'rsi_14', 'price_range', 'vol_ratio'
 ]
-
+ 
 # Interaction features that encode regime-conditional momentum
-# return_x_regime: does the stock move with the market regime?
-# rsi_x_regime: does RSI signal persist differently in bull vs bear markets?
+# return_x_regime: does the stock move with the market regime
+# rsi_x_regime: does RSI signal persist differently in bull vs bear markets
 INTERACTION_FEATURES = [
-    'return1_x_regime', # return_1d * bull_regime
-    'rsi_x_regime', # rsi_14 * bull_regime
-    'ptma20_x_regime', #price_to_ma20 * bull_regime
+    'return1_x_regime',   # return_1d * bull_regime
+    'rsi_x_regime',       # rsi_14 * bull_regime
+    'ptma20_x_regime',    # price_to_ma20 * bull_regime
 ]
-
+ 
 Features = BASE_FEATURES + ['bull_regime'] + INTERACTION_FEATURES
+ 
 grouped = df.groupby('Symbol')
-
-# Returns
+ 
+# Original features
 df['return_1d']  = grouped['Close'].pct_change(1)
 df['return_5d']  = grouped['Close'].pct_change(5)
 df['return_10d'] = grouped['Close'].pct_change(10)
-
-# Moving averages
 df['ma_5']  = grouped['Close'].rolling(5).mean().reset_index(level=0, drop=True)
 df['ma_20'] = grouped['Close'].rolling(20).mean().reset_index(level=0, drop=True)
 df['ma_50'] = grouped['Close'].rolling(50).mean().reset_index(level=0, drop=True)
-
-# Price relative to MAs
 df['price_to_ma20'] = df['Close'] / df['ma_20'] - 1
 df['price_to_ma50'] = df['Close'] / df['ma_50'] - 1
-
-# Volatility
 df['vol_10'] = grouped['return_1d'].rolling(10).std().reset_index(level=0, drop=True)
 df['vol_20'] = grouped['return_1d'].rolling(20).std().reset_index(level=0, drop=True)
-
-# Price range & volume ratio
 df['price_range'] = (df['High'] - df['Low']) / df['Close']
-df['vol_ratio']   = df['Volume'] / grouped['Volume'].rolling(20).mean().reset_index(level=0, drop=True)
-
-# Target: 1 if next day close > current close, else 0
+df['vol_ratio'] = df['Volume'] / grouped['Volume'].rolling(20).mean().reset_index(level=0, drop=True)
 df['target'] = (grouped['Close'].shift(-1) > df['Close']).astype(int)
-
-# RSI-14 (Wilder smoothing via 14-day rolling mean of gains/losses)
-# Interpretation: RSI > 70 → overbought (bearish signal), RSI < 30 → oversold (bullish signal).
+ 
 def calc_rsi_vectorized(series):
     delta = series.diff()
     gain  = delta.clip(lower=0).rolling(14).mean()
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
     rs    = gain / loss
     return 100 - (100 / (1 + rs))
-
+ 
 df['rsi_14'] = grouped['Close'].apply(calc_rsi_vectorized).reset_index(level=0, drop=True)
-
-# Drop NaNs and convert to float32
+ 
+# Drop NaNs before computing interaction terms (need base features first)
 df = df.dropna(subset=BASE_FEATURES + ['target', 'bull_regime']).copy()
-
-# Compute INTERACTION_FEATURES
+ 
+# Compute interaction features
 df['return1_x_regime'] = df['return_1d'] * df['bull_regime']
-df['rsi_x_regime'] = df['rsi_14'] * df['bull_regime']
-df['ptma_20_x_regime'] = df['price_to_ma20'] * df['bull_regime']
-
+df['rsi_x_regime']     = df['rsi_14']    * df['bull_regime']
+df['ptma20_x_regime']  = df['price_to_ma20'] * df['bull_regime']
+ 
 df = df.dropna(subset=Features).copy()
 df[Features] = df[Features].astype(np.float32)
-
-print(f"Usable rows after feature engineering: {len(df):,}")
-
-# Class balance check
+ 
+print(f"\nUsable rows after feature engineering: {len(df):,}")
+print(f"Total features: {len(Features)} (13 original + 1 regime + 3 interaction)")
+ 
 class_counts = pd.Series(df['target'].values).value_counts().sort_index()
-print("\nClass distribution:")
-print(f"  0 (Down): {class_counts.get(0, 0):,}  ({class_counts.get(0, 0)/len(df)*100:.1f}%)")
-print(f"  1 (Up)  : {class_counts.get(1, 0):,}  ({class_counts.get(1, 0)/len(df)*100:.1f}%)")
-
+print(f"\nClass distribution:")
+print(f"  0 (Down): {class_counts.get(0,0):,}  ({class_counts.get(0,0)/len(df)*100:.1f}%)")
+print(f"  1 (Up)  : {class_counts.get(1,0):,}  ({class_counts.get(1,0)/len(df)*100:.1f}%)")
+ 
 X = df[Features].values
 y = df['target'].values
 
@@ -176,7 +167,7 @@ COLORS = {
     'LSTM':            '#8B5CF6',
 }
  
-def run_cv(model_name, make_model_fn, X, y, tscv, threshold=0.5):
+def run_cv(model_name, make_model_fn, X, y, tscv):
     fold_results = []
     print(f"\n{'─'*55}")
     print(f"  {model_name}")
@@ -191,25 +182,15 @@ def run_cv(model_name, make_model_fn, X, y, tscv, threshold=0.5):
         X_val  = scaler.transform(X_val_raw)
  
         model = make_model_fn()
-        model.fit(X_tr, y_tr)
+        sample_weights = compute_sample_weight('balanced', y_tr)
+        model.fit(X_tr, y_tr, sample_weight=sample_weights)
  
         if hasattr(model, 'predict_proba'):
             y_score = model.predict_proba(X_val)[:, 1]
         else:
             y_score = model.decision_function(X_val)
  
-        # Use calibrated threshold instead of 0.5
-        # For models with predict_proba, threshold tuning on training fold
-        if hasattr(model, 'predict_proba') and threshold == 'auto':
-            tr_score = model.predict_proba(X_tr)[:, 1]
-            best_thresh, best_f1 = 0.5, 0.0
-            for t in np.arange(0.40, 0.61, 0.01):
-                f1 = f1_score(y_tr, (tr_score >= t).astype(int), zero_division=0)
-                if f1 > best_f1:
-                    best_f1, best_thresh = f1, t
-            y_pred = (y_score >= best_thresh).astype(int)
-        else:
-            y_pred = model.predict(X_val)
+        y_pred = model.predict(X_val)
  
         metrics = {
             'accuracy':  accuracy_score(y_val, y_pred),
@@ -245,8 +226,7 @@ MODELS = {
 
 all_results = {}
 for name, factory in MODELS.items():
-    thresh = 'auto' if name == 'LR (balanced)' else 0.5
-    all_results[name] = run_cv(name, factory, X, y, tscv, threshold=thresh)
+    all_results[name] = run_cv(name, factory, X, y, tscv)
 
 # =============================================================================
 # 5b. LSTM with TimeSeriesSplit (PyTorch)
@@ -256,124 +236,97 @@ for name, factory in MODELS.items():
 # Each fold uses the same TimeSeriesSplit indices as the sklearn models
 # so the forward-chaining discipline is identicial
 
-SEQ_LEN = 10 # look back window: 10 day trading days, predict day 11
-BATCH = 256
-EPOCHS = 30
-LR = 1e-3
-HIDDEN = 64
+EQ_LEN = 10
+BATCH   = 256
+EPOCHS  = 30
+LR_RATE = 1e-3
+HIDDEN  = 64
 N_LAYERS = 2
-DROPOUT = 0.2
-
+DROPOUT  = 0.2
+ 
 class LSTMClassifier(nn.Module):
-    """ LSTM for binary classification on time-series feature sequences """
     def __init__(self, input_size, hidden_size, num_layers, dropout):
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_size = input_size, 
-            hidden_size = hidden_size,
-            num_layers = num_layers,
-            batch_first = True,
-            dropout = dropout if num_layers > 1 else 0.0
-        )
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size,
+                            num_layers=num_layers, batch_first=True,
+                            dropout=dropout if num_layers > 1 else 0.0)
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_size, 1)
-
+ 
     def forward(self, x):
-        # x shape: (batch, seq_len, features)
         lstm_out, _ = self.lstm(x)
-        last_hidden = lstm_out[:, -1, :] # take last time step
-        out = self.dropout(last_hidden)
-        return self.fc(out).squeeze(-1) # (batch) raw logits
-
+        last_hidden = lstm_out[:, -1, :]
+        return self.fc(self.dropout(last_hidden)).squeeze(-1)
+ 
 def build_sequences(X_flat, y_flat, seq_len):
-    """
-    Slide a window of length 'seq_len' over the flat (row-ordered) feature
-    matrix. The label for each window is the target of the last row in the window. 
-    Returns (X_seq, y_seq) as numpy arrays
-    """
     X_seq, y_seq = [], []
     for i in range(seq_len, len(X_flat)):
-        X_seq.append(X_flat[i - seq_len : i])
+        X_seq.append(X_flat[i - seq_len: i])
         y_seq.append(y_flat[i])
     return np.array(X_seq, dtype=np.float32), np.array(y_seq, dtype=np.float32)
-
+ 
 def train_lstm_fold(X_tr_seq, y_tr_seq, X_val_seq, y_val_seq):
-    """ Train one LSTM fold and return predictions and probability scores """
     train_ds = TensorDataset(torch.tensor(X_tr_seq), torch.tensor(y_tr_seq))
-    train_d1 = DataLoader(train_ds, batch_size=BATCH, shuffle=False)
-
-    model = LSTMClassifier(
-        input_size = X_tr_seq.shape[2], hidden_size = HIDDEN,
-        num_layers = N_LAYERS, dropout = DROPOUT).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    train_dl = DataLoader(train_ds, batch_size=BATCH, shuffle=False)
+    model = LSTMClassifier(X_tr_seq.shape[2], HIDDEN, N_LAYERS, DROPOUT).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR_RATE)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
     criterion = nn.BCEWithLogitsLoss()
-
-    # Training
     model.train()
     for epoch in range(EPOCHS):
-        for xb, yb in train_d1:
+        epoch_loss, n_samples = 0.0, 0
+        for xb, yb in train_dl:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             optimizer.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
+            loss = criterion(model(xb), yb)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-    
-    # Validation
+            epoch_loss += loss.item() * len(xb)
+            n_samples += len(xb)
+        scheduler.step(epoch_loss / n_samples)
     model.eval()
     with torch.no_grad():
         xv = torch.tensor(X_val_seq).to(DEVICE)
-        logits = model(xv)
-        probs = torch.sigmoid(logits).cpu().numpy()
+        probs = torch.sigmoid(model(xv)).cpu().numpy()
         preds = (probs >= 0.5).astype(int)
     return preds, probs
-
-print(f"\n{'-'*52}")
-print(f" LSTM (seq_len={SEQ_LEN}, hidden={HIDDEN}, layers={N_LAYERS})")
-print(f"\n{'-'*52}")
-
+ 
+print(f"\n{'-'*55}")
+print(f"  LSTM (seq_len={SEQ_LEN}, hidden={HIDDEN}, layers={N_LAYERS})")
+print(f"{'-'*55}")
+ 
 lstm_fold_results = []
-
 for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
     X_tr_raw, X_val_raw = X[train_idx], X[val_idx]
     y_tr_raw, y_val_raw = y[train_idx], y[val_idx]
-
-    # Scale using training data only 
+ 
     scaler = StandardScaler()
-    X_tr_sc = scaler.fit_transform(X_tr_raw)
+    X_tr_sc  = scaler.fit_transform(X_tr_raw)
     X_val_sc = scaler.transform(X_val_raw)
-
-    # Build sequences from the scaled data
-    # Training sequences: built entirely within training set
-    X_tr_seq, y_tr_seq = build_sequences(X_tr_sc, y_tr_raw, SEQ_LEN)
-
-    # Validation sequences: bridge last SEQ_LEN training rows as context 
-    # so the first validation prediction has a full look back window
-    # The bridged training rows are already scaled
+ 
+    X_tr_seq, y_tr_seq   = build_sequences(X_tr_sc, y_tr_raw, SEQ_LEN)
     X_bridge = np.concatenate([X_tr_sc[-SEQ_LEN:], X_val_sc], axis=0)
     y_bridge = np.concatenate([y_tr_raw[-SEQ_LEN:], y_val_raw], axis=0)
     X_val_seq, y_val_seq = build_sequences(X_bridge, y_bridge, SEQ_LEN)
-
+ 
     preds, probs = train_lstm_fold(X_tr_seq, y_tr_seq, X_val_seq, y_val_seq)
-
     metrics = {
         'accuracy':  accuracy_score(y_val_seq, preds),
         'precision': precision_score(y_val_seq, preds, zero_division=0),
         'recall':    recall_score(y_val_seq, preds, zero_division=0),
         'f1':        f1_score(y_val_seq, preds, zero_division=0),
         'auc':       roc_auc_score(y_val_seq, probs),
-        'y_pred':    preds,
-        'y_score':   probs,
-        'y_true':    y_val_seq,
+        'y_pred': preds, 'y_score': probs, 'y_true': y_val_seq,
     }
     lstm_fold_results.append(metrics)
-    print(f" Fold {fold}: acc={metrics['accuracy']:.4f}  f1={metrics['f1']:.4f}  auc={metrics['auc']:.4f}")
-
+    print(f"  Fold {fold}: acc={metrics['accuracy']:.4f}  f1={metrics['f1']:.4f}  auc={metrics['auc']:.4f}")
+ 
 print()
 for key in ['accuracy', 'precision', 'recall', 'f1', 'auc']:
     vals = [r[key] for r in lstm_fold_results]
-    print(f" Mean {key:9s}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
-
+    print(f"  Mean {key:9s}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+ 
 all_results['LSTM'] = lstm_fold_results
 
 # =============================================================================
