@@ -44,17 +44,52 @@ df = df.dropna(subset=price_cols).copy()
 n_stocks = df['Symbol'].nunique()
 print(f"Full dataset: {n_stocks} stocks, {len(df):,} rows")
  
+# =============================================================================
+# 1. NOVEL CONTRIBUTION: MARKET REGIME FEATURE
+# =============================================================================
+"""
+For each trading date, compute a cross-sectional median close price across
+all S&P 500 stocks in the dataset as a proxy for the broad market index.
+
+Then label each day as BULL (1) if the market proxy is above its 200-day MA,
+or BEAR (0) if below. This captures whether the broad market environment
+favors upward moves, which individual stock models typically ignore.
+
+Why this is novel:
+  - Standard pipelines use only per-stock technical indicators
+  - This adds macro context without requiring a separate index dataset
+  - The regime label can interact with per-stock features (see interaction terms below)
+"""
+print("\nComputing market regime feature...")
+market_daily = df.groupby('Date')['Close'].median().rename('market_proxy').reset_index()
+market_daily = market_daily.sort_values('Date').reset_index(drop=True)
+market_daily['market_ma200'] = market_daily['market_proxy'].rolling(200).mean()
+market_daily['bull_regime'] = (market_daily['market_proxy'] > market_daily['market_ma200']).astype(np.float32)
+
+# Merge regime back into main df
+df = df.merge(market_daily[['Date', 'bull_regime']], on='Date', how='left')
+print(f"Bull regime days: {df['bull_regime'].mean()*100:.1f}% of rows")
 
 # =============================================================================
-# 1. FEATURE ENGINEERING
+# 2. FEATURE ENGINEERING
 # =============================================================================
-Features = [
+BASE_FEATURES = [
     'return_1d', 'return_5d', 'return_10d',
     'ma_5', 'ma_20', 'ma_50',
     'price_to_ma20', 'price_to_ma50',
     'vol_10', 'vol_20', 'rsi_14', 'price_range', 'vol_ratio'
 ]
 
+# Interaction features that encode regime-conditional momentum
+# return_x_regime: does the stock move with the market regime?
+# rsi_x_regime: does RSI signal persist differently in bull vs bear markets?
+INTERACTION_FEATURES = [
+    'return1_x_regime', # return_1d * bull_regime
+    'rsi_x_regime', # rsi_14 * bull_regime
+    'ptma20_x_regime', #price_to_ma20 * bull_regime
+]
+
+Features = BASE_FEATURES + ['bull_regime'] + INTERACTION_FEATURES
 grouped = df.groupby('Symbol')
 
 # Returns
@@ -94,7 +129,14 @@ def calc_rsi_vectorized(series):
 df['rsi_14'] = grouped['Close'].apply(calc_rsi_vectorized).reset_index(level=0, drop=True)
 
 # Drop NaNs and convert to float32
-df = df.dropna(subset=Features + ['target']).copy()
+df = df.dropna(subset=BASE_FEATURES + ['target', 'bull_regime']).copy()
+
+# Compute INTERACTION_FEATURES
+df['return1_x_regime'] = df['return_1d'] * df['bull_regime']
+df['rsi_x_regime'] = df['rsi_14'] * df['bull_regime']
+df['ptma_20_x_regime'] = df['price_to_ma20'] * df['bull_regime']
+
+df = df.dropna(subset=Features).copy()
 df[Features] = df[Features].astype(np.float32)
 
 print(f"Usable rows after feature engineering: {len(df):,}")
@@ -109,42 +151,66 @@ X = df[Features].values
 y = df['target'].values
 
 # =============================================================================
-# 2. TIMESERIES SPLIT EVALUATION
+# 3. REGIME-STRATIFIED ANALYSIS 
+# =============================================================================
+# Validate that bull_regime has predictive value by checking class distributions
+# in bull vs bear regimes. If Up% differs meaningfully, the feature is informative
+bull_up = df[df['bull_regime'] == 1]['target'].mean()
+bear_up = df[df['bull_regime'] == 0]['target'].mean()
+print(f"\nRegime Validation:")
+print(f"  Bull regime - Up day rate: {bull_up*100:.1f}%")
+print(f"  Bear regime - Up day rate: {bear_up*100:.1f}%")
+print(f"  Difference: {(bull_up - bear_up)*100:.2f} percentage points")
+
+# =============================================================================
+# 4. TIMESERIES SPLIT EVALUATION
 # =============================================================================
 N_SPLITS = 5
 tscv = TimeSeriesSplit(n_splits=N_SPLITS)
-
+ 
 COLORS = {
-    'Logistic Regression': '#378ADD',
-    'RidgeClassifier':     '#E24B4A',
-    'LDA':                 '#2EAD6D',
-    'kNN':                 '#F5A623',
-    'LSTM':                '#8B5CF6',
+    'LR (balanced)':   '#378ADD',
+    'RidgeClassifier': '#E24B4A',
+    'LDA':             '#2EAD6D',
+    'kNN':             '#F5A623',
+    'LSTM':            '#8B5CF6',
 }
-
-def run_cv(model_name, make_model_fn, X, y, tscv):
+ 
+def run_cv(model_name, make_model_fn, X, y, tscv, threshold=0.5):
     fold_results = []
-    print(f"\n{'─'*52}")
+    print(f"\n{'─'*55}")
     print(f"  {model_name}")
-    print(f"{'─'*52}")
-
+    print(f"{'─'*55}")
+ 
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
         X_tr_raw, X_val_raw = X[train_idx], X[val_idx]
         y_tr, y_val         = y[train_idx], y[val_idx]
-
+ 
         scaler = StandardScaler()
         X_tr   = scaler.fit_transform(X_tr_raw)
         X_val  = scaler.transform(X_val_raw)
-
+ 
         model = make_model_fn()
         model.fit(X_tr, y_tr)
-        y_pred = model.predict(X_val)
-
+ 
         if hasattr(model, 'predict_proba'):
             y_score = model.predict_proba(X_val)[:, 1]
         else:
             y_score = model.decision_function(X_val)
-
+ 
+        # Use calibrated threshold instead of 0.5
+        # For models with predict_proba, threshold tuning on training fold
+        if hasattr(model, 'predict_proba') and threshold == 'auto':
+            tr_score = model.predict_proba(X_tr)[:, 1]
+            best_thresh, best_f1 = 0.5, 0.0
+            for t in np.arange(0.40, 0.61, 0.01):
+                f1 = f1_score(y_tr, (tr_score >= t).astype(int), zero_division=0)
+                if f1 > best_f1:
+                    best_f1, best_thresh = f1, t
+            y_pred = (y_score >= best_thresh).astype(int)
+        else:
+            y_pred = model.predict(X_val)
+ 
         metrics = {
             'accuracy':  accuracy_score(y_val, y_pred),
             'precision': precision_score(y_val, y_pred, zero_division=0),
@@ -158,31 +224,32 @@ def run_cv(model_name, make_model_fn, X, y, tscv):
         fold_results.append(metrics)
         print(f"  Fold {fold}: acc={metrics['accuracy']:.4f}  "
               f"f1={metrics['f1']:.4f}  auc={metrics['auc']:.4f}")
-
+ 
     print()
     for key in ['accuracy', 'precision', 'recall', 'f1', 'auc']:
         vals = [r[key] for r in fold_results]
         print(f"  Mean {key:9s}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
-
+ 
     return fold_results
 
 # =============================================================================
-# 3a. TRAIN sklean MODELS (LR, Ridge, LDA, kNN)
+# 5a. TRAIN sklean MODELS (LR, Ridge, LDA, kNN)
 # =============================================================================
 MODELS = {
-    'Logistic Regression': lambda: LogisticRegression(C=1.0, solver='lbfgs', max_iter=300, random_state=42),
+    'LR (balanced)':       lambda: LogisticRegression(C=1.0, solver='lbfgs', max_iter=300, random_state=42, class_weight='balanced'),
     'RidgeClassifier':     lambda: RidgeClassifier(alpha=1.0),
     'LDA':                 lambda: LinearDiscriminantAnalysis(solver='svd'),
-    'kNN':                 lambda: KNeighborsClassifier(n_neighbors=21, weights='distance', metric='minkowski', n_jobs=-1),
+    'kNN':                 lambda: KNeighborsClassifier(n_neighbors=31, weights='distance', metric='minkowski', n_jobs=-1),
 
 }
 
 all_results = {}
 for name, factory in MODELS.items():
-    all_results[name] = run_cv(name, factory, X, y, tscv)
+    thresh = 'auto' if name == 'LR (balanced)' else 0.5
+    all_results[name] = run_cv(name, factory, X, y, tscv, threshold=thresh)
 
 # =============================================================================
-# 3b. LSTM with TimeSeriesSplit (PyTorch)
+# 5b. LSTM with TimeSeriesSplit (PyTorch)
 # =============================================================================
 # The LSTM sees a sliding window of SEQ_LEN consecutive days of features
 # and predicts whether the stock goes up on the day after the window. 
@@ -310,7 +377,7 @@ for key in ['accuracy', 'precision', 'recall', 'f1', 'auc']:
 all_results['LSTM'] = lstm_fold_results
 
 # =============================================================================
-# 4. SUMMARY TABLE
+# 6. SUMMARY TABLE
 # =============================================================================
 METRICS = ['accuracy', 'precision', 'recall', 'f1', 'auc']
 rows = []
@@ -326,10 +393,10 @@ print("\n\n=== CROSS-VALIDATED RESULTS (mean ± std, 5 folds) ===")
 print(summary_df.to_string())
 
 # =============================================================================
-# 5. PLOTS
+# 7. PLOTS
 # =============================================================================
 
-# 5a. Metric comparison bar chart
+# 7a. Metric comparison bar chart
 fig, axes = plt.subplots(1, len(METRICS), figsize=(20, 5))
 fig.suptitle('Model Comparison — Mean CV Metrics (+/- 1 std)', fontweight='bold')
 
@@ -354,7 +421,7 @@ plt.tight_layout()
 plt.savefig('results_metric_comparison.png', bbox_inches='tight')
 plt.close()
 
-# 5b. ROC curves (last fold)
+# 7b. ROC curves (last fold)
 fig, ax = plt.subplots(figsize=(7, 5.5))
 ax.plot([0, 1], [0, 1], 'k--', linewidth=0.9, label='Random (AUC = 0.50)')
 
@@ -373,7 +440,7 @@ plt.tight_layout()
 plt.savefig('results_roc_curves.png', bbox_inches='tight')
 plt.close()
 
-# 5c. Confusion matrices
+# 7c. Confusion matrices
 n_models = len(all_results)
 fig, axes = plt.subplots(1, n_models, figsize=(4.2 * n_models, 4))
 fig.suptitle('Confusion Matrices — Final Fold (row-normalized)', fontweight='bold')
@@ -393,7 +460,7 @@ plt.tight_layout()
 plt.savefig('results_confusion_matrices.png', dpi=150, bbox_inches='tight')
 plt.close()
 
-# 5d. Logistic Regression feature coefficients
+# 7d. Logistic Regression feature coefficients
 scaler_full = StandardScaler()
 X_scaled = scaler_full.fit_transform(X)
 lr_final = LogisticRegression(C=1.0, solver='lbfgs', max_iter=300, random_state=42)
@@ -412,7 +479,7 @@ plt.tight_layout()
 plt.savefig('results_lr_coefficients.png', bbox_inches='tight')
 plt.close()
 
-# 5e. LDA feature weights (scalings on the single discriminant axis)
+# 7e. LDA feature weights (scalings on the single discriminant axis)
 lda_final = LinearDiscriminantAnalysis(solver='svd')
 lda_final.fit(X_scaled, y)
 
@@ -428,7 +495,7 @@ plt.tight_layout()
 plt.savefig('results_lda_scalings.png', dpi=150, bbox_inches='tight')
 plt.close()
 
-# 5f. LSTM training loss curve (full data refit for visualization)
+# 7f. LSTM training loss curve (full data refit for visualization)
 print("\nFitting LSTM on full data for loss curve plot...")
 scaler_lstm = StandardScaler()
 X_lstm_full = scaler_lstm.fit_transform(X)
@@ -467,7 +534,7 @@ plt.tight_layout()
 plt.savefig('results_lstm_loss_curve.png', dpi=150, bbox_inches='tight')
 plt.close()
 
-# 5g. Per-fold accuracy over time
+# 7g. Per-fold accuracy over time
 fig, ax = plt.subplots(figsize=(8, 4.5))
 folds_x = np.arange(1, N_SPLITS + 1)
 
@@ -486,7 +553,7 @@ plt.tight_layout()
 plt.savefig('results_fold_accuracy.png', bbox_inches='tight')
 plt.close()
 
-# RSI sanity check
+# RSI check
 print("\n\n=== RSI CHECK ===")
 print(f"LR coefficient for rsi_14: {lr_final.coef_[0][Features.index('rsi_14')]:.6f}")
 print(f"LDA scaling for rsi_14: {lda_final.scalings_[Features.index('rsi_14')][0]:.6f}")
@@ -500,5 +567,42 @@ down_rsi = df.loc[df['target'] == 0, 'rsi_14'].mean()
 
 print(f" Mean RSI when target = 1 (Up): {up_rsi:.2f}")
 print(f" Mean RSI when target = 0 (Down): {down_rsi:.2f}")
+
+# 7h. Regime split accuracy to compare model accuracy in bull vs bear regimes
+print("\nComputing regime-split accuracy...")
+fig, ax = plt.subplots(figsize=(9, 4.5))
+x_pos = np.arange(len(all_results))
+width = 0.35
+ 
+# Use final fold only for regime analysis
+regime_bull_acc, regime_bear_acc = [], []
+for name, folds in all_results.items():
+    last = folds[-1]
+    y_true, y_pred = last['y_true'], last['y_pred']
+    # Align regime labels to final fold val indices
+    val_idx = list(tscv.split(X))[-1][1]
+    # For LSTM, val_idx is offset by SEQ_LEN
+    if name == 'LSTM':
+        regime_vals = df['bull_regime'].values[val_idx[SEQ_LEN:] if len(val_idx) > len(y_true) else val_idx[:len(y_true)]]
+    else:
+        regime_vals = df['bull_regime'].values[val_idx[:len(y_true)]]
+    bull_mask = regime_vals == 1
+    bear_mask = regime_vals == 0
+    ba = accuracy_score(y_true[bull_mask], y_pred[bull_mask]) if bull_mask.sum() > 0 else np.nan
+    bea = accuracy_score(y_true[bear_mask], y_pred[bear_mask]) if bear_mask.sum() > 0 else np.nan
+    regime_bull_acc.append(ba)
+    regime_bear_acc.append(bea)
+ 
+ax.bar(x_pos - width / 2, regime_bull_acc, width, label='Bull Regime', color='#378ADD', alpha=0.85, edgecolor='none')
+ax.bar(x_pos + width / 2, regime_bear_acc, width, label='Bear Regime', color='#E24B4A', alpha=0.85, edgecolor='none')
+ax.axhline(0.50, color='gray', linestyle='--', linewidth=0.9)
+ax.set_xticks(x_pos)
+ax.set_xticklabels(list(all_results.keys()), fontsize=9)
+ax.set_ylabel('Accuracy')
+ax.set_title('Model Accuracy by Market Regime — Final Fold', fontweight='bold')
+ax.legend(fontsize=9)
+plt.tight_layout()
+plt.savefig('results_regime_accuracy.png', dpi=150, bbox_inches='tight')
+plt.close()
 
 print("\nDone. All result plots saved.")
